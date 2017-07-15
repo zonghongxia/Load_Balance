@@ -1,0 +1,486 @@
+#ifndef _FOIO_H
+#define _FOIO_H
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <assert.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/epoll.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <iostream>
+#include <vector>
+
+
+typedef bool BOOL;
+
+using namespace std;
+
+class process
+{
+public:
+	process():m_pid(-1){}
+
+public:
+	pid_t m_pid;
+	int m_pipefd[2];
+};
+
+
+class FSer
+{
+	char Ip[128];
+	int port;
+public:
+	FSer(char *buf,int po);
+	FSer(const FSer &ser);
+	char *GetIp();
+	int GetPort();
+	void init(char *buf,int po);
+	~FSer();
+
+};
+
+
+
+class FCli
+{
+private:
+	int sockfd;
+	char strptr[128];
+	int port;
+	void Connect();
+public:
+	FCli(const char *buf,int po);
+	void CreateCli();
+	int GetSockfd();
+	~FCli();
+};
+
+static FSer Traverse(int pos,vector<FSer> TableSer)
+{
+	cout<<"FSer pos:"<<pos<<" "<<endl;
+	vector<FSer>::iterator it = TableSer.begin();
+	while(pos > 0)
+	{	
+		--pos;
+		++it;
+		if(it == TableSer.end())
+		{
+			//pos = 0;
+			it = TableSer.begin();
+		}	
+	}
+	
+	return *it;
+}
+
+template<typename T>
+class processpool
+{
+private:
+	processpool(int listenfd,int process_number = 3);
+public:
+	static processpool<T>* create(int listenfd,int process_number = 3)
+	{
+		if(!m_instance)
+		{
+			m_instance = new processpool<T>(listenfd,process_number);
+			cout<<"create:"<<getpid()<<endl;
+		}
+		return m_instance;
+	}
+	~processpool()
+	{
+		
+		if(NULL != m_sub_process)
+		{
+			cout<<"pid:"<<getpid()<<endl;
+			cout<<"~xigou"<<endl;
+			delete [] m_sub_process;
+			m_sub_process = NULL;
+		}
+		//delete [] m_instance;
+	}
+
+	void run();
+
+public:
+	static void InitInsert();
+	static vector<FSer> gt;
+
+private:
+	void setup_sig_pipe();
+	void run_parent();
+	void run_child();
+private:
+	static const int MAX_PROCESS_NUMBER = 16;
+	static const int USER_PER_PROCESS = 65536;
+	static const int MAX_EVENT_NUMBER = 100;
+	int m_process_number;
+	int m_idx;
+	int m_epollfd;
+	int m_listenfd;
+	int m_stop;
+	process* m_sub_process;
+	FCli cli;
+	static processpool<T>* m_instance;
+};
+
+template<typename T>
+processpool<T>* processpool<T>::m_instance = NULL;
+
+template<typename T>
+vector<FSer> processpool<T>::gt = vector<FSer>();
+
+template<typename T>
+void processpool<T>::InitInsert()
+{
+	FSer ser1("127.0.0.1",9521);
+	FSer ser2("127.0.0.1",9522);
+	FSer ser3("127.0.0.1",9523);
+	gt.push_back(ser1);
+	gt.push_back(ser2);
+	gt.push_back(ser3);
+}
+
+static int sig_pipefd[2];
+static int setnonblocking(int fd)
+{
+	int old_option = fcntl(fd,F_GETFL);
+	int new_option = old_option | O_NONBLOCK;
+	fcntl(fd,F_SETFL,new_option);
+	return old_option;
+}
+static void addfd(int epollfd,int fd)
+{
+	epoll_event event;
+	event.data.fd = fd;
+	event.events = EPOLLIN | EPOLLET;
+	epoll_ctl(epollfd,EPOLL_CTL_ADD,fd,&event);
+	setnonblocking(fd);
+}
+static void removefd(int epollfd,int fd)
+{
+	epoll_ctl(epollfd,EPOLL_CTL_DEL,fd,0);
+	close(fd);
+}
+static void sig_handler(int sig)//信号处理函数
+{
+	int save_errno = errno;
+	int msg = sig;
+	send(sig_pipefd[1],(char *)&msg,1,0);//信号处理函数往管道的写端写入信号量
+	errno = save_errno;
+}
+static void addsig(int sig,void (handler)(int),bool restart = true)//设置信号处理函数
+{
+	struct sigaction sa;
+	memset(&sa,0,sizeof(sa));
+	sa.sa_handler = handler;
+	if(restart)
+	{
+		sa.sa_flags |= SA_RESTART;
+	}
+	sigfillset(&sa.sa_mask);
+	assert(sigaction(sig,&sa,NULL) != -1);
+}
+template<typename T>
+processpool<T>::processpool(int listenfd,int process_number)
+	:m_listenfd(listenfd),m_process_number(process_number),m_idx(-1),cli("0.0.0.0",0000)
+{
+
+	InitInsert();
+
+	assert((process_number >0) && (process_number <= MAX_PROCESS_NUMBER));
+	cout<<"gouzao "<<endl;
+	m_sub_process = new process[process_number];
+
+	for(int i=0; i<process_number; ++i)
+	{
+		int ret = socketpair(PF_UNIX,SOCK_STREAM,0,m_sub_process[i].m_pipefd);
+		if(ret < 0)
+		{
+			perror("sockpair error :");
+		}
+		assert(ret == 0);
+
+		m_sub_process[i].m_pid = fork();
+		assert(m_sub_process[i].m_pid >= 0);
+		if(m_sub_process[i].m_pid > 0)
+		{
+			close(m_sub_process[i].m_pipefd[1]);
+			continue;
+		}
+		else
+		{
+			close(m_sub_process[i].m_pipefd[0]);
+
+			cout<<"i%3="<<i%3<<endl;
+			FSer ser = Traverse(i%3,gt);
+			cout<<"ser.Ip:"<<ser.GetIp()<<"  "<<"ser.port:"<<ser.GetPort()<<endl;
+			FCli tmp(ser.GetIp(),ser.GetPort());
+			cli = tmp;
+			cli.CreateCli();
+			m_idx = i;
+			break;
+		}
+	}
+}
+template<typename T>
+void processpool<T>::setup_sig_pipe()
+{
+	m_epollfd = epoll_create(5);//创建每一个进程的内核事件表
+	assert(m_epollfd != -1);
+
+	int ret = socketpair(PF_UNIX,SOCK_STREAM,0,sig_pipefd);//创建信号处理管道
+	assert(ret != -1);
+
+	setnonblocking(sig_pipefd[1]);//设置非阻塞信号管道写端描述符
+	addfd(m_epollfd,sig_pipefd[0]);//将读端描述符加入到内核事件表上
+
+	addsig(SIGCHLD,sig_handler);//设置信号处理函数
+	addsig(SIGTERM,sig_handler);
+	addsig(SIGINT,sig_handler);
+	addsig(SIGPIPE,SIG_IGN);
+}
+
+template<typename T>
+void processpool<T>::run()
+{
+	if(m_idx != -1)
+	{
+		run_child();
+		return ;
+	}
+	run_parent();
+}
+
+template<typename T>
+void processpool<T>::run_child()
+{
+	setup_sig_pipe();//创建内核事件表以及创建信号管道
+
+	int sersockfd = cli.GetSockfd();
+
+	int pipefd = m_sub_process[m_idx].m_pipefd[1];
+	addfd(m_epollfd,pipefd);
+
+	epoll_event events[MAX_EVENT_NUMBER];
+	//T* users = new T[MAX_EVENT_NUMBER];
+	T users[MAX_EVENT_NUMBER];
+	assert(users);
+
+	int number = 0;
+	int ret = -1;
+
+	while(!m_stop)
+	{
+		cout<<"child ------------------------------epoll_wait again"<<endl;
+		number = epoll_wait(m_epollfd,events,MAX_EVENT_NUMBER,-1);
+		cout<<"epoll_wait over"<<endl;
+		if((number < 0) && (errno != EINTR))
+		{
+			cout<<"epoll_wait failure"<<endl;
+			break;
+		}
+		for(int i=0; i<number; ++i)
+		{
+			int sockfd = events[i].data.fd;
+			if((sockfd == pipefd) && (events[i].events & EPOLLIN))
+			{
+				int client = 0;
+				ret = recv(sockfd,(char *)&client,sizeof(client),0);
+				if(((ret < 0) && (errno != EAGAIN)) || ret == 0)
+				{
+					continue;
+				}
+				else
+				{
+					struct sockaddr_in client_address;
+					socklen_t client_addrlength = sizeof(client_address);
+					int connfd = accept(m_listenfd,(struct sockaddr *)&client_address,&client_addrlength);//每一个新的客户链接都是通过描述符m_listen监听到的，所以从m_listen上去accept新链接
+					if(connfd < 0)
+					{
+						cout<<"errno is : "<<errno<<endl;
+						continue;
+					}
+					addfd(m_epollfd,connfd);
+					cout<<"foio.h connfd="<<connfd<<endl;
+					users[connfd].init(m_epollfd,connfd,client_address,sersockfd);
+				}
+			}
+			else if((sockfd == sig_pipefd[0]) && (events[i].events & EPOLLIN))
+			{
+				int sig;
+				char signals[1024];
+				ret = recv(sig_pipefd[0],signals,sizeof(signals),0);
+				if(ret <= 0)
+				{
+					continue;
+				}
+				else
+				{
+					for(int i=0; i<ret; ++i)
+					{
+						switch(signals[i])
+						{
+							/*case SIGCHLD:
+								pid_t pid;
+								int stat;
+								while((pid = waitpid(-1,&stat,WNOHANG)) > 0)
+								{
+									continue;
+								}
+								break;*/
+							case SIGTERM:
+							case SIGINT:
+								m_stop = true;
+								break;
+							default:
+								break;
+						}
+					}
+				}
+			}
+			else if(events[i].events & EPOLLIN)
+			{
+				cout<<"child enter process sockfd="<<sockfd<<endl;
+				users[sockfd].process();
+			}
+			else
+			{
+				continue;
+			}
+		}
+	}
+	cout<<"delete shuzu"<<endl;
+	//delete [] users;
+	//users = NULL;
+	close(pipefd);
+	close(m_epollfd);
+}
+
+template<typename T>
+void processpool<T>::run_parent()
+{
+	setup_sig_pipe();
+	addfd(m_epollfd,m_listenfd);
+	epoll_event events[MAX_EVENT_NUMBER];
+	int sub_process_counter = 0;
+	int new_conn = 1;
+	int number = 0;
+	int ret = -1;
+
+	while(!m_stop)
+	{
+		number = epoll_wait(m_epollfd,events,MAX_EVENT_NUMBER,-1);
+		if((number < 0) && (errno != EINTR))
+		{
+			cout<<"parent epoll failure"<<endl;
+			break;
+		}
+		for(int i=0; i<number; ++i)
+		{
+			int sockfd = events[i].data.fd;
+			if(sockfd == m_listenfd)
+			{
+				int i = sub_process_counter;
+				do
+				{
+					if(m_sub_process[i].m_pid != -1)
+					{
+						break;
+					}
+					i = (i+1)%m_process_number;
+				}while(i != sub_process_counter);
+				if(m_sub_process[i].m_pid == -1)
+				{
+					m_stop = true;
+					break;
+				}
+				sub_process_counter = (i+1)%m_process_number;
+				send(m_sub_process[i].m_pipefd[0],(char *)&new_conn,sizeof(new_conn),0);
+				cout<<"send request to child :"<<i<<endl;
+			}
+			else if((sockfd == sig_pipefd[0]) && (events[i].events & EPOLLIN))
+			{
+				int sig;
+				char signals[1024];
+				ret = recv(sig_pipefd[0],signals,sizeof(signals),0);
+				if(ret <= 0)
+				{
+					continue;
+				}
+				else
+				{
+					for(int i=0; i<ret; ++i)
+					{
+						switch(signals[i])
+						{
+							case SIGCHLD:
+								pid_t pid;
+								int stat;
+								while((pid = waitpid(-1,&stat,WNOHANG)) > 0)
+								{
+									for(int i=0; i<m_process_number; ++i)
+									{
+										if(m_sub_process[i].m_pid == pid)
+										{
+											cout<<"one child join:"<<i<<endl;
+											close(m_sub_process[i].m_pipefd[0]);
+											m_sub_process[i].m_pid = -1;
+										}
+									}
+								}
+								m_stop = true;
+								for(int i=0; i<m_process_number; ++i)
+								{
+									if(m_sub_process[i].m_pid != -1)
+									{
+										m_stop = false;
+									}
+									break;
+								}
+							case SIGTERM:
+							case SIGINT:
+								cout<<"kill all child now"<<endl;
+								for(int i=0; i<m_process_number; ++i)
+								{
+									int pid = m_sub_process[i].m_pid;
+									if(pid != -1)
+									{
+										kill(pid,SIGKILL);
+									}
+									//cout<<"i:"<<i<<"pid:"<<pid<<endl;
+								}
+								break;
+							default:
+								break;
+						}
+					}
+				}
+			}
+			else
+			{
+				continue;
+			}
+		}
+		//close(m_epollfd);
+	}
+	//cout<<"m_epollfd:"<<m_epollfd<<endl;
+	close(m_epollfd);
+}
+
+
+
+
+
+#endif
